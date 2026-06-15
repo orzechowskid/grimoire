@@ -1,0 +1,49 @@
+{
+  "models": {
+    "embedding": {
+      "repo_id": "Sprylab/paraphrase-multilingual-MiniLM-L12-v2-onnx-quantized",
+      "dim": 384,
+      "max_length": 512
+    },
+    "ner": {
+      "repo_id": "onnx-community/distilbert-NER-ONNX"
+    },
+    "reranker": {
+      "repo_id": "cross-encoder/ms-marco-TinyBERT-L2-v2"
+    },
+    "observer": {
+      "repo_id": "HuggingFaceTB/SmolLM2-1.7B-Instruct-GGUF"
+    }
+  },
+  "storage": {
+    "db_path": "~/.grimoire/memory.db"
+  },
+  "search": {
+    "embedding_dim": 384,
+    "pipeline_width": 4,
+    "half_life_days": 30
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8766
+  },
+  "observer": {
+    "brief_max_length": 1000
+  },
+  "proxy": {
+    "inference_server_url": "http://office:11434",
+    "inference_server_key": "test-key-placeholder",
+    "port": 8767,
+    "memory_lib_url": "http://127.0.0.1:8766",
+    "cors_origin": "*",
+    "memory_injection": {
+      "enabled": true,
+      "top_k": 10,
+      "time_weighted": false
+    },
+    "observation": {
+      "enabled": true,
+      "batch_size": 1
+    }
+  }
+}

@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: MIT
+
+"""Anchor model — irreducible event skeleton."""
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+
+logger = logging.getLogger("memory_lib.subconscious.anchor")
+
+
+@dataclass
+class Anchor:
+    """Irreducible event skeleton.
+    
+    Created at observe() time for every significant session.
+    Context around it decays; the anchor itself persists forever.
+    """
+    anchor_id: str                    # = session_id (1:1)
+    session_id: str
+    brief: str                        # max 500 chars (configurable) — never decays
+    anchor_type: str                  # decision/constraint/milestone/event/observation
+    
+    # Key facts from entities — sorted by priority, max stored at creation
+    # Decay will reduce this list over time, but minimum 1-2 remain forever
+    key_facts: list[dict[str, Any]] = field(default_factory=list)
+    # Each fact: {"type": str, "value": str, "score": float, "priority": int}
+    
+    # Primary flags — set by Observer at creation, reassessed by Dreamer later
+    flags: dict[str, Any] = field(default_factory=lambda: {
+        "is_new_entity": True,        # new or continuation of previous
+        "continuation_of": None,      # session_id if continuation
+        "continuation_depth": 0,      # how many sessions deep
+        "mention_type": "focus",      # focus | passing
+        "outcome": "pending",         # pending | success | failure | neutral | abandoned
+        "user_pin": False,            # user said "remember" / "note this"
+        "multi_session": False,       # part of process spanning > 2 sessions
+    })
+    
+    # Decay metadata
+    decay_level: int = 0              # 0=full, 1=partial, 2=skeleton, 3=bedrock
+    access_count: int = 0             # times "remembered" / resurfaced
+    last_accessed_at: int = 0         # last resurface timestamp
+    
+    # Temporal relation graph — directed links to other anchor/entity IDs
+    # {"after": [...], "before": [...], "caused_by": [...], "during": [...]}
+    t_rel: dict[str, Any] = field(default_factory=lambda: {
+        "after": [], "before": [], "caused_by": [], "during": []
+    })
+
+    # Timestamps
+    created_at: int = 0
+    updated_at: int = 0
+
+    # Embedding for semantic search (Guardian, Surfacing) — not persisted in to_dict()
+    # Set at creation time from Observer Step 1 embedding. Rehydrated on load_anchors()
+    # from sessions table JOIN (anchor_id == session_id).
+    embedding: np.ndarray | None = field(default=None, repr=False, compare=False)
+    
+    def touch(self) -> None:
+        """Record an access (resurface from silt)."""
+        self.access_count += 1
+        self.last_accessed_at = int(time.time())
+        self.updated_at = self.last_accessed_at
+    
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize for SQLite JSON fields."""
+        return {
+            "anchor_id": self.anchor_id,
+            "session_id": self.session_id,
+            "brief": self.brief,
+            "anchor_type": self.anchor_type,
+            "key_facts": self.key_facts,
+            "flags": self.flags,
+            "decay_level": self.decay_level,
+            "access_count": self.access_count,
+            "last_accessed_at": self.last_accessed_at,
+            "t_rel": self.t_rel,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Anchor":
+        """Deserialize from SQLite row."""
+        if "t_rel" not in data:
+            data = {**data, "t_rel": {"after": [], "before": [], "caused_by": [], "during": []}}
+        # Strip any extra/unknown keys so **data won't raise TypeError
+        valid_keys = cls.__dataclass_fields__.keys()
+        clean_data = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**clean_data)

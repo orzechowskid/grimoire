@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# ============================================================
+# Grimoire — Single Entrypoint Orchestration Script
+# ============================================================
+#
+# Usage:
+#   ./grimoire start     — Start both services
+#   ./grimoire stop      — Stop both services
+#   ./grimoire status    — Show status of both services
+#   ./grimoire restart   — Restart both services
+#   ./grimoire models    — Download or check ONNX models
+#   ./grimoire init      — Download models, create dirs, first-time setup
+#   ./grimoire help      — Show this help message
+#
+# Flags for 'start':
+#   --ensure-models        Run model check/download before starting services
+#   --brief-max-length=N   Set maximum brief length for memory entries (default 500)
+#
+# Flags for 'models':
+#   --check            Verify models present, don't re-download
+#   --force            Force re-download all models
+#
+# Manual Test Steps:
+#   1. Run  ./grimoire start
+#      → Confirm both services start and health checks pass
+#      → Confirm success banner with connection details
+#   2. Run  ./grimoire status
+#      → Confirm both services show as healthy with PIDs
+#   3. Run  curl http://127.0.0.1:8767/health
+#      → Confirm proxy responds with {"status":"ok",...}
+#   4. Run  curl http://127.0.0.1:8766/health
+#      → Confirm memory library responds with {"status":"ok",...}
+#   5. Run  ./grimoire stop
+#      → Confirm graceful shutdown and PID files cleaned up
+#   6. Run  ./grimoire start  (with services already running)
+#      → Confirm conflict detection warns about port usage
+#   7. Run  ./grimoire start  then press Ctrl+C
+#      → Confirm signal trap triggers clean shutdown
+# ============================================================
+
+set -euo pipefail
+
+# ────────────────────────────────────────────────────────────
+# Constants & paths
+# ────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+MEMORY_LIB_PORT=8766
+PROXY_PORT=8767
+
+PYTHON="$SCRIPT_DIR/venv/bin/python"
+MEMORY_LIB_LOG="$SCRIPT_DIR/logs/memory_lib.log"
+PROXY_LOG="$SCRIPT_DIR/logs/proxy.log"
+MEMORY_LIB_PID="$SCRIPT_DIR/run/memory_lib.pid"
+PROXY_PID="$SCRIPT_DIR/run/proxy.pid"
+
+MEMORY_LIB_PROC_NAME="uvicorn memory_lib.api.routes:app"
+PROXY_PROC_NAME="nodemon src/index.ts"
+
+# ────────────────────────────────────────────────────────────
+# Helper functions
+# ────────────────────────────────────────────────────────────
+
+log_info() {
+    echo -e "\033[32m[grimoire]\033[0m $*"
+}
+
+log_warn() {
+    echo -e "\033[33m[grimoire]\033[0m WARNING: $*"
+}
+
+log_error() {
+    echo -e "\033[31m[grimoire]\033[0m ERROR: $*" >&2
+}
+
+# Check if a port is in use by any process
+check_port() {
+    local port="$1"
+    if command -v fuser &>/dev/null; then
+        fuser "${port}/tcp" &>/dev/null && return 0
+    elif command -v lsof &>/dev/null; then
+        lsof -i ":${port}" &>/dev/null && return 0
+    elif command -v ss &>/dev/null; then
+        ss -tlnp "sport = :${port}" &>/dev/null && return 0
+    else
+        # Fallback: try to connect with curl
+        curl -sf --max-time 2 "http://127.0.0.1:${port}/health" &>/dev/null && return 0
+    fi
+    return 1
+}
+
+# Poll a health endpoint up to max_retries times (1s apart)
+# Returns 0 if healthy, 1 otherwise
+health_check() {
+    local url="$1"
+    local max_retries="${2:-30}"
+    local retry=0
+
+    while [ "$retry" -lt "$max_retries" ]; do
+        if curl -sf --max-time 2 "$url" &>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        retry=$((retry + 1))
+    done
+
+    log_error "Health check failed: $url (tried $max_retries times)"
+    return 1
+}
+
+# Send SIGTERM/SIGKILL to an entire process group (PGID)
+kill_process_group() {
+    local pgid="$1"
+    local proc_name="$2"
+    local max_wait="${3:-10}"
+
+    # Guard against PGID 0 or 1 (should never happen, but safety first)
+    if [ "$pgid" -le 1 ] 2>/dev/null; then
+        log_warn "Refusing to kill process group $pgid for $proc_name (too low)."
+        return 1
+    fi
+
+    # Send SIGTERM to entire process group
+    log_info "Stopping $proc_name (PGID $pgid)..."
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+
+    # Wait for graceful shutdown
+    local waited=0
+    while [ "$waited" -lt "$max_wait" ]; do
+        if ! kill -0 -- "-$pgid" 2>/dev/null; then
+            log_info "$proc_name stopped gracefully."
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # Escalate to SIGKILL
+    log_warn "$proc_name did not stop in ${max_wait}s. Sending SIGKILL."
+    kill -9 -- "-$pgid" 2>/dev/null || true
+    sleep 1
+    log_info "$proc_name killed."
+    return 0
+}
+
+# Send SIGTERM to a process by PID, wait up to max_wait seconds,
+# then SIGKILL if still alive.
+stop_service() {
+    local pid_file="$1"
+    local proc_name="$2"
+    local max_wait="${3:-10}"
+    local port="${4:-}"
+
+    if [ ! -f "$pid_file" ]; then
+        # No PID file, but check if port is occupied (orphaned process)
+        if [ -n "$port" ] && check_port "$port"; then
+            log_warn "Port $port is in use but no PID file for $proc_name. Killing orphan..."
+            fuser -k "${port}/tcp" 2>/dev/null || true
+            sleep 1
+        fi
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null) || true
+
+    if [ -z "$pid" ]; then
+        rm -f "$pid_file"
+        return 0
+    fi
+
+    # Check if process is alive
+    if ! kill -0 "$pid" 2>/dev/null; then
+        log_warn "Process $proc_name (PID $pid) is not running."
+        rm -f "$pid_file"
+        return 0
+    fi
+
+    # Resolve process group ID
+    local pgid
+    pgid=$(ps -o pgid= "$pid" 2>/dev/null | tr -d ' ')
+    if [ -z "$pgid" ]; then
+        log_warn "Could not determine PGID for $proc_name (PID $pid). Killing PID only."
+        pgid="$pid"
+    fi
+
+    kill_process_group "$pgid" "$proc_name" "$max_wait"
+
+    # Verify port is actually released
+    if [ -n "$port" ] && check_port "$port"; then
+        log_warn "Port $port is still in use after stopping $proc_name. Force-killing holder..."
+        fuser -k "${port}/tcp" 2>/dev/null || true
+        sleep 1
+        if check_port "$port"; then
+            log_error "Port $port is still in use after force-kill. Manual intervention may be required."
+        else
+            log_info "Port $port freed after force-kill."
+        fi
+    fi
+
+    rm -f "$pid_file"
+    return 0
+}
+
+# Cleanup both services (used on failure during startup)
+cleanup() {
+    log_warn "Cleaning up..."
+    stop_service "$PROXY_PID" "$PROXY_PROC_NAME" 5 "$PROXY_PORT"
+    stop_service "$MEMORY_LIB_PID" "$MEMORY_LIB_PROC_NAME" 5 "$MEMORY_LIB_PORT"
+}
+
+# Write a PID file atomically (write to .tmp then mv)
+write_pid() {
+    local pid_file="$1"
+    local pid="$2"
+    local tmp_file="${pid_file}.tmp"
+    echo "$pid" > "$tmp_file"
+    mv -f "$tmp_file" "$pid_file"
+}
+
+# ────────────────────────────────────────────────────────────
+# Subcommands
+# ────────────────────────────────────────────────────────────
+
+cmd_start() {
+    local ensure_models=false
+    local brief_max_length=""
+    shift  # consume "start"
+
+    # Parse flags before processing as a command
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ensure-models)
+                ensure_models=true
+                shift
+                ;;
+            --brief-max-length=*)
+                brief_max_length="${1#*=}"
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    log_info "Starting Grimoire..."
+
+    # 0. Optional model check/download
+    if [ "$ensure_models" = true ]; then
+        run_models "${args[@]+"${args[@]}"}"
+    fi
+
+    # 1. Export config path for both services
+    export GRIMOIRE_CONFIG="$SCRIPT_DIR/config.json"
+    if [ -f "$GRIMOIRE_CONFIG" ]; then
+        log_info "Configuration: $GRIMOIRE_CONFIG"
+    else
+        log_warn "No config.json at $GRIMOIRE_CONFIG — services will use defaults."
+    fi
+
+    # 2. Create directories
+    mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/run"
+
+    # Clean up stale PID files (process dead but PID file remains)
+    if [ -f "$PROXY_PID" ]; then
+        local old_proxy_pid
+        old_proxy_pid=$(cat "$PROXY_PID" 2>/dev/null) || true
+        if [ -n "$old_proxy_pid" ] && ! kill -0 "$old_proxy_pid" 2>/dev/null; then
+            log_warn "Stale PID file for proxy (PID $old_proxy_pid is dead). Cleaning up."
+            rm -f "$PROXY_PID"
+        fi
+    fi
+    if [ -f "$MEMORY_LIB_PID" ]; then
+        local old_mem_pid
+        old_mem_pid=$(cat "$MEMORY_LIB_PID" 2>/dev/null) || true
+        if [ -n "$old_mem_pid" ] && ! kill -0 "$old_mem_pid" 2>/dev/null; then
+            log_warn "Stale PID file for memory library (PID $old_mem_pid is dead). Cleaning up."
+            rm -f "$MEMORY_LIB_PID"
+        fi
+    fi
+
+    # Kill orphaned processes occupying our ports (no PID file but port in use)
+    if check_port "$PROXY_PORT" && [ ! -f "$PROXY_PID" ]; then
+        log_warn "Port $PROXY_PORT is in use but no PID file found. Killing orphan..."
+        fuser -k "${PROXY_PORT}/tcp" 2>/dev/null || true
+        sleep 2
+    fi
+    if check_port "$MEMORY_LIB_PORT" && [ ! -f "$MEMORY_LIB_PID" ]; then
+        log_warn "Port $MEMORY_LIB_PORT is in use but no PID file found. Killing orphan..."
+        fuser -k "${MEMORY_LIB_PORT}/tcp" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # 3. Check for conflicting processes
+    local port_conflict=false
+    if check_port "$MEMORY_LIB_PORT"; then
+        log_error "Port $MEMORY_LIB_PORT is already in use. Is the memory library already running?"
+        port_conflict=true
+    fi
+    if check_port "$PROXY_PORT"; then
+        log_error "Port $PROXY_PORT is already in use. Is the proxy already running?"
+        port_conflict=true
+    fi
+    if [ "$port_conflict" = true ]; then
+        log_error "Refusing to start. Stop existing services first with './grimoire stop'."
+        exit 1
+    fi
+
+    # 4. Start Python memory library
+    log_info "Starting memory library on port $MEMORY_LIB_PORT..."
+
+    cd "$SCRIPT_DIR"
+    setsid $PYTHON -m uvicorn memory_lib.api.routes:app \
+        --host 127.0.0.1 \
+        --port "$MEMORY_LIB_PORT" \
+        --log-level info \
+        >> "$MEMORY_LIB_LOG" 2>&1 &
+    local mem_pid=$!
+
+    # Write PID atomically
+    write_pid "$MEMORY_LIB_PID" "$mem_pid"
+    log_info "Memory library started (PID $mem_pid)"
+
+    # 5. Poll memory library health check
+    log_info "Waiting for memory library to become healthy..."
+    if ! health_check "http://127.0.0.1:${MEMORY_LIB_PORT}/health"; then
+        log_error "Memory library failed to start."
+        cleanup
+        exit 1
+    fi
+    log_info "Memory library is healthy."
+
+    # 6. Start TypeScript proxy
+    log_info "Starting proxy on port $PROXY_PORT..."
+
+    cd "$SCRIPT_DIR/src/proxy"
+    setsid ./node_modules/.bin/nodemon src/index.ts >> "$PROXY_LOG" 2>&1 &
+    local proxy_pid=$!
+
+    # Write PID atomically
+    write_pid "$PROXY_PID" "$proxy_pid"
+    log_info "Proxy started (PID $proxy_pid)"
+
+    # 7. Poll proxy health check
+    log_info "Waiting for proxy to become healthy..."
+    if ! health_check "http://127.0.0.1:${PROXY_PORT}/health"; then
+        log_error "Proxy failed to start."
+        cleanup
+        exit 1
+    fi
+    log_info "Proxy is healthy."
+
+    # 8. Success banner
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║            🪄 Grimoire is running!                       ║"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    echo "║  Proxy:     http://127.0.0.1:${PROXY_PORT}                    ║"
+    echo "║  Memory:    http://127.0.0.1:${MEMORY_LIB_PORT}                   ║"
+    echo "║  PID files: run/memory_lib.pid, run/proxy.pid            ║"
+    echo "║  Logs:      logs/memory_lib.log, logs/proxy.log          ║"
+    echo "║                                                          ║"
+    echo "║  Point your agent harness to http://127.0.0.1:${PROXY_PORT}   ║"
+    echo "║  Press Ctrl+C or run './grimoire stop' to shut down.     ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+
+    # 9. Trap signals for foreground shutdown
+    trap handle_signal INT TERM
+
+    # Stay in foreground — wait for background processes
+    while true; do
+        # Check if either process died unexpectedly
+        if ! kill -0 "$mem_pid" 2>/dev/null; then
+            log_warn "Memory library process died unexpectedly."
+            break
+        fi
+        if ! kill -0 "$proxy_pid" 2>/dev/null; then
+            log_warn "Proxy process died unexpectedly."
+            break
+        fi
+        sleep 2 &
+        wait $! 2>/dev/null || true  # Allow signal interruption
+    done
+
+    handle_signal
+}
+
+cmd_stop() {
+    log_info "Stopping Grimoire..."
+
+    # 1. Stop proxy first
+    stop_service "$PROXY_PID" "$PROXY_PROC_NAME" 10 "$PROXY_PORT"
+
+    # 2. Send shutdown to memory library if responding
+    if curl -sf -X POST --max-time 3 "http://127.0.0.1:${MEMORY_LIB_PORT}/shutdown" &>/dev/null; then
+        log_info "Sent shutdown signal to memory library."
+        sleep 2
+    else
+        log_warn "Memory library not responding to /shutdown."
+    fi
+
+    # 3. Stop memory library
+    stop_service "$MEMORY_LIB_PID" "$MEMORY_LIB_PROC_NAME" 15 "$MEMORY_LIB_PORT"
+
+    # 4. Remove any stale PID files
+    rm -f "$PROXY_PID" "$MEMORY_LIB_PID"
+
+    # 5. Confirmation
+    log_info "Grimoire stopped."
+}
+
+cmd_status() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║                📊 Grimoire Status                        ║"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    printf "║  %-20s %-34s ║\n" "Service:" "Status:"
+    echo "╠══════════════════════════════════════════════════════════╣"
+
+    # Memory library status
+    local mem_status="stopped"
+    local mem_pid_display="—"
+    if [ -f "$MEMORY_LIB_PID" ]; then
+        local mem_pid
+        mem_pid=$(cat "$MEMORY_LIB_PID" 2>/dev/null) || true
+        if [ -n "$mem_pid" ] && kill -0 "$mem_pid" 2>/dev/null; then
+            mem_pid_display="$mem_pid"
+            if curl -sf --max-time 2 "http://127.0.0.1:${MEMORY_LIB_PORT}/health" &>/dev/null; then
+                mem_status="healthy"
+                printf "║  %-20s %-34s ║\n" "Memory Library:" "● ${mem_status} (PID ${mem_pid_display})"
+            else
+                mem_status="unhealthy"
+                printf "║  %-20s %-34s ║\n" "Memory Library:" "● ${mem_status} (PID ${mem_pid_display})"
+            fi
+        else
+            mem_status="dead (stale PID file)"
+            printf "║  %-20s %-34s ║\n" "Memory Library:" "○ ${mem_status}"
+        fi
+    else
+        # Fallback: check port even without PID file (detect orphans)
+        if check_port "$MEMORY_LIB_PORT"; then
+            local orphan_pid
+            orphan_pid=$(fuser "${MEMORY_LIB_PORT}/tcp" 2>/dev/null | tr -d ' ')
+            printf "║  %-20s %-34s ║\n" "Memory Library:" "● running (orphan PID $orphan_pid)"
+        else
+            printf "║  %-20s %-34s ║\n" "Memory Library:" "○ ${mem_status}"
+        fi
+    fi
+
+    # Proxy status
+    local proxy_status="stopped"
+    local proxy_pid_display="—"
+    if [ -f "$PROXY_PID" ]; then
+        local proxy_pid
+        proxy_pid=$(cat "$PROXY_PID" 2>/dev/null) || true
+        if [ -n "$proxy_pid" ] && kill -0 "$proxy_pid" 2>/dev/null; then
+            proxy_pid_display="$proxy_pid"
+            if curl -sf --max-time 2 "http://127.0.0.1:${PROXY_PORT}/health" &>/dev/null; then
+                proxy_status="healthy"
+                printf "║  %-20s %-34s ║\n" "Proxy:" "● ${proxy_status} (PID ${proxy_pid_display})"
+            else
+                proxy_status="unhealthy"
+                printf "║  %-20s %-34s ║\n" "Proxy:" "● ${proxy_status} (PID ${proxy_pid_display})"
+            fi
+        else
+            proxy_status="dead (stale PID file)"
+            printf "║  %-20s %-34s ║\n" "Proxy:" "○ ${proxy_status}"
+        fi
+    else
+        # Fallback: check port even without PID file (detect orphans)
+        if check_port "$PROXY_PORT"; then
+            local orphan_pid
+            orphan_pid=$(fuser "${PROXY_PORT}/tcp" 2>/dev/null | tr -d ' ')
+            printf "║  %-20s %-34s ║\n" "Proxy:" "● running (orphan PID $orphan_pid)"
+        else
+            printf "║  %-20s %-34s ║\n" "Proxy:" "○ ${proxy_status}"
+        fi
+    fi
+
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+cmd_restart() {
+    cmd_stop
+    cmd_start
+}
+
+# ────────────────────────────────────────────────────────────
+# Model helpers
+# ────────────────────────────────────────────────────────────
+
+run_models() {
+    log_info "Running model check/download..."
+    "$PYTHON" "$SCRIPT_DIR/scripts/download_models.py" "$@"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log_error "Model check/download failed (exit code $rc)."
+        return "$rc"
+    fi
+    log_info "Models OK."
+    return 0
+}
+
+cmd_models() {
+    local force=""
+    shift  # consume "models"
+
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force)
+                force="--force"
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Always pass --force last if set, after any other args
+    if [ -n "$force" ]; then
+        args+=("$force")
+    fi
+
+    run_models "${args[@]+"${args[@]}"}"
+}
+
+cmd_init() {
+    log_info "Initializing Grimoire..."
+
+    # 1. Download / check models
+    run_models
+
+    # 2. Create required directories
+    mkdir -p "$SCRIPT_DIR/logs" "$SCRIPT_DIR/run"
+
+    # 3. Confirmation
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║            ✨ Grimoire initialized!                      ║"
+    echo "╠══════════════════════════════════════════════════════════╣"
+    echo "║  Models    : downloaded / verified                       ║"
+    echo "║  Logs      : logs/                                       ║"
+    echo "║  PID files : run/                                        ║"
+    echo "║                                                          ║"
+    echo "║  Start services with: ./grimoire start                   ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# ────────────────────────────────────────────────────────────
+# Signal handler
+# ────────────────────────────────────────────────────────────
+
+handle_signal() {
+    echo ""
+    log_info "Received signal. Shutting down..."
+    cleanup
+    exit 0
+}
+
+# ────────────────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────────────────
+
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        start)
+            cmd_start "$@"
+            ;;
+        stop)
+            cmd_stop
+            ;;
+        status)
+            cmd_status
+            ;;
+        restart)
+            cmd_restart
+            ;;
+        models)
+            cmd_models "$@"
+            ;;
+        init)
+            cmd_init
+            ;;
+        help|--help|-h)
+            echo "Usage: $0 {start|stop|status|restart|models|init|help}"
+            echo ""
+            echo "Subcommands:"
+            echo "  start    Start both the memory library and proxy"
+            echo "             --ensure-models        Run model check/download before starting"
+            echo "             --brief-max-length=N   Set max brief length (default 500)"
+            echo "  stop     Stop both services gracefully"
+            echo "  status   Show status of both services"
+            echo "  restart  Stop then start both services"
+            echo "  models   Download or check ONNX models"
+            echo "             --check            Verify models present, don't re-download"
+            echo "             --force            Force re-download all models"
+            echo "  init     First-time setup: download models, create directories"
+            echo "  help     Show this help message"
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            echo "Run '$0 help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
