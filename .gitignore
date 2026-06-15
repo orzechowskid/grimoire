@@ -3,3 +3,5 @@ logs/
 run/
 .late/
 .envvenv/
+**/__pycache__/
+**/*.egg-info/
